@@ -12,7 +12,11 @@ from svcdir import DirectoryStore, create_app
 from svcdir.errors import (
     BackupValidationError,
     ConflictError,
+    DatabaseError,
+    InputError,
     NotFoundError,
+    ReceiptNotFound,
+    RequestIdConflict,
     RestoreInProgress,
 )
 
@@ -781,3 +785,528 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Request-id receipts
+# ---------------------------------------------------------------------------
+
+
+def test_first_request_with_id_persists_receipt_before_answer(store):
+    store.upsert("orders", "10.0.0.1:80")
+    current = store.resolve("orders")
+
+    result = store.resolve_with_receipt("orders", "req-1")
+
+    assert result["found"] is True
+    assert result["address"] == "10.0.0.1:80"
+    assert result["replay"] is False
+    assert result["request_id"] == "req-1"
+    assert result["version"] == current["version"]
+
+    # The receipt is durably stored and independently retrievable.
+    receipt = store.get_receipt("req-1")
+    assert receipt == result["receipt"]
+    assert receipt["service"] == "orders"
+    assert receipt["found"] is True
+    assert receipt["address"] == "10.0.0.1:80"
+    assert receipt["version"] == current["version"]
+
+
+def test_retry_same_id_same_service_replays_original_through_changes(store):
+    store.upsert("orders", "10.0.0.1:80")
+    store.upsert("other", "keep-me")
+    first = store.resolve_with_receipt("orders", "req-1")
+    first_version = first["version"]
+
+    # Pin a backup, then re-address, delete, and finally restore over the
+    # directory so the live value diverges from the recorded answer.
+    store.upsert("orders", "10.0.0.2:80")
+    store.create_backup("snap")
+    store.upsert("orders", "10.0.0.9:80")
+    store.delete("orders")
+    store.upsert("orders", "10.0.0.9:80")
+    store.delete("other")
+    store.restore_backup("snap")
+
+    for _ in range(3):
+        again = store.resolve_with_receipt("orders", "req-1")
+        assert again["replay"] is True
+        assert again["found"] is True
+        assert again["address"] == "10.0.0.1:80"
+        assert again["version"] == first_version
+        assert again["receipt"]["version"] == first_version
+
+    # The live directory really has moved on and differs from the receipt.
+    assert store.resolve("orders")["address"] == "10.0.0.2:80"
+    # The restore also brought back a service deleted after the backup.
+    assert store.resolve("other")["address"] == "keep-me"
+    # Exactly one receipt row exists for the id.
+    assert len([r for r in store.list_receipts(100) if r["request_id"] == "req-1"]) == 1
+
+
+def test_same_id_different_service_is_conflict_and_original_intact(store):
+    store.upsert("orders", "10.0.0.1:80")
+    store.upsert("billing", "10.0.0.9:80")
+    store.resolve_with_receipt("orders", "req-1")
+
+    with pytest.raises(RequestIdConflict) as excinfo:
+        store.resolve_with_receipt("billing", "req-1")
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.bound_service == "orders"
+    assert excinfo.value.requested_service == "billing"
+
+    # The conflicting attempt created no second receipt and changed nothing.
+    receipt = store.get_receipt("req-1")
+    assert receipt["service"] == "orders"
+    assert receipt["address"] == "10.0.0.1:80"
+
+    # The original pair still replays.
+    again = store.resolve_with_receipt("orders", "req-1")
+    assert again["replay"] is True
+    assert again["address"] == "10.0.0.1:80"
+
+
+def test_not_found_is_recorded_and_replayed_as_not_found(store):
+    store.resolve  # sanity: empty directory
+    first = store.resolve_with_receipt("ghost", "req-miss")
+    assert first["found"] is False
+    assert first["address"] is None
+    assert first["replay"] is False
+    assert first["receipt"]["found"] is False
+
+    # Even after the service appears, the recorded miss is replayed.
+    store.upsert("ghost", "10.0.0.7:7")
+    again = store.resolve_with_receipt("ghost", "req-miss")
+    assert again["replay"] is True
+    assert again["found"] is False
+    assert again["address"] is None
+
+    receipt = store.get_receipt("req-miss")
+    assert receipt["found"] is False
+    assert receipt["address"] is None
+
+
+def test_concurrent_same_id_keeps_single_receipt(store):
+    store.upsert("orders", "10.0.0.1:80")
+    results: list[dict] = []
+    errors: list[Exception] = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        try:
+            results.append(store.resolve_with_receipt("orders", "req-race"))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+
+    assert not errors, errors
+    assert len(results) == 8
+    answers = {(r["found"], r["address"], r["version"]) for r in results}
+    assert answers == {(True, "10.0.0.1:80", results[0]["version"])}
+    # Exactly one thread created the receipt; the rest replayed it.
+    assert sum(1 for r in results if not r["replay"]) == 1
+    assert sum(1 for r in results if r["replay"]) == 7
+    assert len([r for r in store.list_receipts(100) if r["request_id"] == "req-race"]) == 1
+
+
+def test_concurrent_same_id_different_services_only_one_wins(store):
+    store.upsert("svc-a", "addr-a")
+    store.upsert("svc-b", "addr-b")
+    outcome: dict[str, object] = {}
+    barrier = threading.Barrier(2)
+
+    def worker(service: str):
+        barrier.wait()
+        try:
+            outcome[service] = store.resolve_with_receipt(service, "req-dup")
+        except RequestIdConflict as exc:
+            outcome[service] = exc
+
+    threads = [
+        threading.Thread(target=worker, args=("svc-a",)),
+        threading.Thread(target=worker, args=("svc-b",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+
+    winner = next(s for s, v in outcome.items() if isinstance(v, dict))
+    loser = next(s for s, v in outcome.items() if isinstance(v, RequestIdConflict))
+    assert {winner, loser} == {"svc-a", "svc-b"}
+    assert outcome[loser].bound_service == winner
+
+    receipt = store.get_receipt("req-dup")
+    assert receipt["service"] == winner
+    # Retries for the winner's service always succeed via replay.
+    replay = store.resolve_with_receipt(winner, "req-dup")
+    assert replay["replay"] is True
+    assert replay["address"] == f"addr-{winner[-1]}"
+    # The loser can never bind the id.
+    with pytest.raises(RequestIdConflict):
+        store.resolve_with_receipt(loser, "req-dup")
+
+
+def test_receipt_answers_match_committed_version_under_continuous_publish(store):
+    """Directory publish and receipt write interleave: every receipt must
+    correspond to one committed version and answer exactly that version."""
+    store.upsert("hot", "addr-0")
+    stop = threading.Event()
+    receipts: list[dict] = []
+    rids: list[str] = []
+
+    def publisher():
+        i = 1
+        while not stop.is_set():
+            store.upsert("hot", f"addr-{i}")
+            i += 1
+
+    t = threading.Thread(target=publisher)
+    t.start()
+    try:
+        for i in range(60):
+            rid = f"req-hot-{i}"
+            rids.append(rid)
+            # Mix found and not-found receipts.
+            target = "hot" if i % 2 == 0 else "missing-svc"
+            receipts.append(store.resolve_with_receipt(target, rid))
+    finally:
+        stop.set()
+        t.join(10)
+
+    with sqlite3.connect(store.db_path) as conn:
+        for result in receipts:
+            rid = result["request_id"]
+            row = conn.execute(
+                "SELECT service, version_id, found, address FROM receipts WHERE request_id=?",
+                (rid,),
+            ).fetchone()
+            assert row is not None, f"receipt {rid} was not persisted"
+            service, version_id, found, address = row
+            assert version_id == result["version"]
+            assert bool(found) == result["found"]
+            assert address == result["address"]
+            # Cross-check against the committed entries of that exact version.
+            entry = conn.execute(
+                "SELECT address FROM entries WHERE version_id=? AND service=?",
+                (version_id, service),
+            ).fetchone()
+            if found:
+                assert entry is not None
+                assert entry[0] == address == result["address"]
+            else:
+                assert entry is None
+                assert address is None
+    assert len(store.list_receipts(200)) == 60
+
+
+def test_persist_failure_returns_error_never_unrecorded_address(store, monkeypatch):
+    store.upsert("orders", "10.0.0.1:80")
+
+    # Simulate a storage failure specifically when the receipt is persisted.
+    # The whole request is one transaction, so it rolls back and no answer is
+    # returned without its record.
+    original_connect = store._connect
+
+    class FailingConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and sql.lstrip().upper().startswith("INSERT") \
+                    and "INTO receipts" in sql:
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, item):
+            return getattr(self._inner, item)
+
+        def close(self):
+            self._inner.close()
+
+    def failing_connect():
+        return FailingConnection(original_connect())
+
+    monkeypatch.setattr(store, "_connect", failing_connect)
+    with pytest.raises(DatabaseError):
+        store.resolve_with_receipt("orders", "req-fail")
+    monkeypatch.undo()
+
+    # No receipt was recorded, so a later retry is a fresh first request.
+    with pytest.raises(ReceiptNotFound):
+        store.get_receipt("req-fail")
+    fresh = store.resolve_with_receipt("orders", "req-fail")
+    assert fresh["replay"] is False
+    assert fresh["address"] == "10.0.0.1:80"
+
+
+def test_receipts_survive_directory_restore_and_process_restart(tmp_path):
+    db = tmp_path / "restart.sqlite3"
+    store = DirectoryStore(db, restore_lease_seconds=30)
+    store.upsert("orders", "10.0.0.1:80")
+    store.create_backup("snap")
+    recorded = store.resolve_with_receipt("orders", "req-stable")
+    store.upsert("orders", "10.0.0.2:80")
+    store.restore_backup("snap")
+
+    # New process, same database file.
+    restarted = DirectoryStore(db, restore_lease_seconds=30)
+    restarted.initialize()
+    replay = restarted.resolve_with_receipt("orders", "req-stable")
+    assert replay["replay"] is True
+    assert replay["address"] == recorded["address"] == "10.0.0.1:80"
+    assert replay["version"] == recorded["version"]
+    assert restarted.get_receipt("req-stable")["request_id"] == "req-stable"
+
+
+def test_id_queries_work_during_restore_and_freeze_after_commit(tmp_path):
+    db = tmp_path / "restore.sqlite3"
+    store = DirectoryStore(db, restore_lease_seconds=30)
+    store.upsert("orders", "old-addr")
+    store.create_backup("snap")
+    store.upsert("orders", "live-addr")
+
+    gate = BlockingHooks().install(store, "validated")
+    done = threading.Event()
+
+    def do_restore():
+        store.restore_backup("snap")
+        done.set()
+
+    t = threading.Thread(target=do_restore)
+    t.start()
+    assert gate.reached.wait(10)
+
+    # While the restore is in flight, id queries still answer from the
+    # current complete directory and persist receipts.
+    mid = store.resolve_with_receipt("orders", "req-mid")
+    assert mid["found"] is True
+    assert mid["address"] == "live-addr"
+    assert mid["restore_in_progress"] is True
+    mid_version = mid["version"]
+
+    gate.release.set()
+    assert done.wait(10)
+    t.join(10)
+
+    # After the commit, new requests read the new version...
+    after = store.resolve_with_receipt("orders", "req-after")
+    assert after["replay"] is False
+    assert after["address"] == "old-addr"
+    assert after["version"] != mid_version
+
+    # ...while the earlier receipt is immutable.
+    replay = store.resolve_with_receipt("orders", "req-mid")
+    assert replay["replay"] is True
+    assert replay["address"] == "live-addr"
+    assert replay["version"] == mid_version
+
+
+def test_request_without_id_remains_unchanged(store):
+    store.upsert("orders", "10.0.0.1:80")
+    plain = store.resolve("orders")
+    assert "request_id" not in plain
+    assert plain["address"] == "10.0.0.1:80"
+    # No receipt rows are created for plain queries.
+    assert store.list_receipts() == []
+
+
+def test_invalid_request_ids_rejected(store):
+    store.upsert("orders", "10.0.0.1:80")
+    for bad in ["", "   ", "bad id", "../x", "x" * 129, "-dash", "a/b"]:
+        with pytest.raises(InputError):
+            store.resolve_with_receipt("orders", bad)
+    with pytest.raises(InputError):
+        store.get_receipt("")
+    # Nothing was persisted.
+    assert store.list_receipts() == []
+
+
+def test_get_missing_receipt_is_404(store):
+    with pytest.raises(ReceiptNotFound):
+        store.get_receipt("nope")
+
+
+def test_v1_database_is_migrated_and_keeps_its_data(tmp_path):
+    db = tmp_path / "v1.sqlite3"
+    # Build a legacy v1 database through the real schema minus receipts.
+    legacy = DirectoryStore(db)
+    legacy.initialize()
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+        conn.execute("DROP TABLE IF EXISTS receipts")
+    legacy.upsert("legacy-svc", "legacy-addr")
+
+    migrated = DirectoryStore(db)
+    migrated.initialize()
+    assert migrated.resolve("legacy-svc")["address"] == "legacy-addr"
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == "2"
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='receipts'"
+        ).fetchone() is not None
+    # Receipts work on the migrated database.
+    result = migrated.resolve_with_receipt("legacy-svc", "req-migrated")
+    assert result["address"] == "legacy-addr"
+    assert migrated.get_receipt("req-migrated")["found"] is True
+
+
+# ---------------------------------------------------------------------------
+# HTTP layer for receipts
+# ---------------------------------------------------------------------------
+
+
+def test_http_resolve_with_request_id_flow(client):
+    assert client.post(
+        "/api/services", json={"service": "orders", "address": "10.0.0.1:80"}
+    ).status_code == 200
+
+    first = client.get("/resolve?name=orders&request_id=req-1")
+    assert first.status_code == 200
+    body = first.get_json()
+    assert body["ok"] is True
+    assert body["address"] == "10.0.0.1:80"
+    assert body["found"] is True
+    assert body["request_id"] == "req-1"
+    assert body["replay"] is False
+    assert body["receipt"]["service"] == "orders"
+
+    # Change the directory, then retry with the same id.
+    client.post("/api/services", json={"service": "orders", "address": "10.0.0.2:80"})
+    retry = client.get("/resolve?name=orders&request_id=req-1")
+    assert retry.status_code == 200
+    rb = retry.get_json()
+    assert rb["replay"] is True
+    assert rb["address"] == "10.0.0.1:80"
+    assert rb["version"] == body["version"]
+
+    # Same id, different service -> 409 conflict.
+    client.post("/api/services", json={"service": "billing", "address": "10.0.0.9:80"})
+    conflict = client.get("/resolve?name=billing&request_id=req-1")
+    assert conflict.status_code == 409
+    assert conflict.get_json()["error"]["code"] == "request_id_conflict"
+
+    # Receipt lookup endpoints.
+    detail = client.get("/api/receipts/req-1")
+    assert detail.status_code == 200
+    assert detail.get_json()["receipt"]["address"] == "10.0.0.1:80"
+    listed = client.get("/api/receipts")
+    assert listed.status_code == 200
+    assert any(r["request_id"] == "req-1" for r in listed.get_json()["receipts"])
+    assert client.get("/api/receipts/unknown").status_code == 404
+
+
+def test_http_resolve_with_id_records_not_found(client):
+    miss = client.get("/resolve?name=ghost&request_id=req-miss")
+    assert miss.status_code == 200
+    mb = miss.get_json()
+    assert mb["found"] is False
+    assert "address" not in mb
+    assert mb["receipt"]["found"] is False
+
+    client.post("/api/services", json={"service": "ghost", "address": "10.0.0.7:7"})
+    replay = client.get("/resolve?name=ghost&request_id=req-miss")
+    assert replay.get_json()["found"] is False
+    assert replay.get_json()["replay"] is True
+
+
+def test_http_request_id_requires_single_name(client):
+    # Full-directory lookup with an id is rejected.
+    resp = client.get("/resolve?request_id=req-x")
+    assert resp.status_code == 400
+    assert resp.get_json()["error"]["code"] == "invalid_input"
+    resp2 = client.get("/resolve?name=&request_id=req-x")
+    assert resp2.status_code == 400
+
+
+def test_http_resolve_without_id_has_no_receipt_fields(client):
+    client.post("/api/services", json={"service": "a", "address": "1"})
+    resp = client.get("/resolve?name=a")
+    body = resp.get_json()
+    assert "request_id" not in body
+    assert "receipt" not in body
+    assert body["address"] == "1"
+    assert client.get("/api/receipts").get_json()["receipts"] == []
+
+
+def test_html_trial_form_and_receipt_page(client):
+    client.post("/api/services", json={"service": "orders", "address": "10.0.0.1:80"})
+
+    # Trial with a request id.
+    resp = client.post(
+        "/resolve-trial",
+        data={"service": "orders", "request_id": "req-html-1"},
+        follow_redirects=True,
+    )
+    assert resp.status_code == 200
+    page = resp.get_data(as_text=True)
+    assert "10.0.0.1:80" in page
+    assert "req-html-1" in page
+    assert "已登记回执" in page
+
+    # Replay trial reports the replay verb.
+    replay = client.post(
+        "/resolve-trial",
+        data={"service": "orders", "request_id": "req-html-1"},
+        follow_redirects=True,
+    )
+    assert "回执重放" in replay.get_data(as_text=True)
+
+    # Not-found trial.
+    miss = client.post(
+        "/resolve-trial",
+        data={"service": "ghost", "request_id": "req-html-miss"},
+        follow_redirects=True,
+    )
+    assert "未找到" in miss.get_data(as_text=True)
+
+    # No-id trial.
+    plain = client.post(
+        "/resolve-trial", data={"service": "orders", "request_id": ""},
+        follow_redirects=True,
+    )
+    assert "不登记回执" in plain.get_data(as_text=True)
+
+    # Receipt detail HTML page.
+    detail = client.get("/receipts/req-html-1")
+    assert detail.status_code == 200
+    detail_text = detail.get_data(as_text=True)
+    assert "10.0.0.1:80" in detail_text
+    assert "orders" in detail_text
+
+    assert client.get("/receipts/unknown").status_code == 404
+
+    # Missing service name is surfaced as an error flash.
+    bad = client.post(
+        "/resolve-trial", data={"service": "", "request_id": ""},
+        follow_redirects=True,
+    )
+    assert bad.status_code == 200
+
+
+def test_html_receipt_page_escapes_hostile_values(client):
+    # Request ids are restricted to a safe charset by validation, so the
+    # hostile payload rides in the address, which the receipt page must escape.
+    rid = "req-hostile-1"
+    client.post(
+        "/api/services",
+        json={"service": "evil", "address": "<script>x</script>"},
+    )
+    client.get(f"/resolve?name=evil&request_id={rid}")
+    page = client.get(f"/receipts/{rid}").get_data(as_text=True)
+    assert "<script>x</script>" not in page
+    assert "&lt;script&gt;" in page
+    assert rid in page
+    # The index page lists receipts and must escape their values too.
+    index = client.get("/").get_data(as_text=True)
+    assert "<script>x</script>" not in index
+    assert "&lt;script&gt;" in index

@@ -107,6 +107,29 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.get("/resolve")
     def resolve():
         name = request.args.get("name")
+        request_id = request.args.get("request_id")
+        if request_id is not None:
+            request_id = request_id.strip()
+        if request_id:
+            # A request id only applies to a single-name lookup; the receipt
+            # records exactly one service/version/answer triple.
+            if not name or not name.strip():
+                raise InputError("带请求号的查询必须指定单个服务名（name）")
+            result = store.resolve_with_receipt(name, request_id)
+            body = {
+                "ok": True,
+                "version": result["version"],
+                "restore_in_progress": result["restore_in_progress"],
+                "name": result["name"],
+                "found": result["found"],
+                "request_id": result["request_id"],
+                "replay": result["replay"],
+                "receipt": result["receipt"],
+            }
+            if result["found"]:
+                body["address"] = result["address"]
+            return jsonify(body), 200
+
         with store.read_view() as view:
             result = view.resolve(name)
         body = {
@@ -161,6 +184,18 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         result = store.restore_backup(name)
         return jsonify({"ok": True, **result})
 
+    @app.get("/api/receipts/<request_id>")
+    def api_get_receipt(request_id: str):
+        return jsonify({"ok": True, "receipt": store.get_receipt(request_id)})
+
+    @app.get("/api/receipts")
+    def api_list_receipts():
+        try:
+            limit = int(request.args.get("limit", "20"))
+        except ValueError:
+            raise InputError("limit 必须是整数")
+        return jsonify({"ok": True, "receipts": store.list_receipts(limit)})
+
     # -- HTML -------------------------------------------------------------
 
     def _redirect_back(**kwargs):
@@ -212,5 +247,44 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
             message=f"已从备份 {result['backup']} 恢复：{result['entry_count']} 条，"
                     f"新目录版本 {result['new_version']}"
         )
+
+    @app.post("/resolve-trial")
+    def form_resolve_trial():
+        """Browser-side trial of /resolve, optionally pinned by a request id."""
+        name = (request.form.get("service") or "").strip()
+        request_id = (request.form.get("request_id") or "").strip()
+        try:
+            if request_id:
+                if not name:
+                    raise InputError("带请求号的查询必须指定单个服务名")
+                result = store.resolve_with_receipt(name, request_id)
+                if result["found"]:
+                    verb = "回执重放" if result["replay"] else "已登记回执并应答"
+                    message = (
+                        f"{verb}：{result['name']} -> {result['address']}"
+                        f"（目录版本 {result['version']}，请求号 {result['request_id']}）"
+                    )
+                else:
+                    verb = "回执重放" if result["replay"] else "已登记未找到回执"
+                    message = (
+                        f"{verb}：服务 {result['name']} 未找到"
+                        f"（目录版本 {result['version']}，请求号 {result['request_id']}）"
+                    )
+            else:
+                if not name:
+                    raise InputError("请输入服务名")
+                result = store.resolve(name)
+                message = (
+                    f"当前查询（无请求号，不登记回执）：{result['name']} -> "
+                    f"{result['address']}（目录版本 {result['version']}）"
+                )
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        return _redirect_back(message=message)
+
+    @app.get("/receipts/<request_id>")
+    def form_receipt_detail(request_id: str):
+        receipt = store.get_receipt(request_id)
+        return render_template("receipt.html", receipt=receipt)
 
     return app

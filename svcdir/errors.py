@@ -55,6 +55,30 @@ class BackupNameTaken(ConflictError):
     code = "backup_name_taken"
 
 
+class RequestIdConflict(ConflictError):
+    """The same request id was already used for a different service."""
+
+    status_code = 409
+    code = "request_id_conflict"
+
+    def __init__(self, request_id: str, requested_service: str, bound_service: str) -> None:
+        super().__init__(
+            f"请求号 {request_id} 已绑定服务 {bound_service}，"
+            f"不能再用于服务 {requested_service}"
+        )
+        self.request_id = request_id
+        self.requested_service = requested_service
+        self.bound_service = bound_service
+
+
+class ReceiptNotFound(NotFoundError):
+    status_code = 404
+    code = "receipt_not_found"
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__(f"找不到请求号 {request_id} 的回执")
+
+
 class BackupValidationError(DirectoryError):
     status_code = 422
     code = "invalid_backup"

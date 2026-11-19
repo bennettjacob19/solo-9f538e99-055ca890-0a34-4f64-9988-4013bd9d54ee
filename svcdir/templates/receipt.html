@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>回执 {{ receipt.request_id }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>查询回执</h1>
+  <p class="sub">请求号一旦登记，同号同服务的重试永远返回这份原始结果。</p>
+</header>
+<main>
+  <section class="card">
+    <table>
+      <tbody>
+        <tr><th>请求号</th><td class="mono">{{ receipt.request_id }}</td></tr>
+        <tr><th>服务名</th><td class="mono">{{ receipt.service }}</td></tr>
+        <tr><th>目录版本</th><td>{{ receipt.version }}</td></tr>
+        <tr>
+          <th>查询结果</th>
+          <td class="mono">
+            {% if receipt.found %}{{ receipt.address }}
+            {% else %}<span class="muted">未找到（not found）</span>{% endif %}
+          </td>
+        </tr>
+        <tr><th>登记时间（UTC）</th><td class="mono small">{{ receipt.created_at }}</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <a class="btnlink" href="{{ url_for('index') }}">返回目录页面</a>
+    </p>
+  </section>
+</main>
+</body>
+</html>

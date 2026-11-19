@@ -2,7 +2,9 @@
 
 一个运行在 Flask + SQLite 上的小型服务发现目录：运维人员可以在网页上修改
 「服务名 → 目标地址」的映射、创建命名备份、并从一个备份恢复。另有 `/resolve`
-查询 API 供客户端使用。
+查询 API 供客户端使用。带**请求号（request id）**的单名查询会把首次结果存成
+不可变的**回执（receipt）**，同号重试永远拿回首次应答，便于值班员事后核对
+客户端曾经得到的地址。
 
 ## 启动
 
@@ -38,21 +40,40 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
-| GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
-| GET | `/resolve` | 返回整个当前目录 |
-| GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
+| GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮、查询试查与回执 |
+| GET | `/resolve?name=<服务名>` | 返回单个服务的地址（无请求号，不登记回执） |
+| GET | `/resolve?name=<服务名>&request_id=<请求号>` | 带号单名查询：首次登记回执后应答，同号重试重放回执 |
+| GET | `/resolve` | 返回整个当前目录（不支持请求号） |
+| GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表、最近回执 |
 | GET | `/api/backups` | 备份列表 |
 | POST | `/api/services` | `{"service": ..., "address": ..., "note": ...}` 新增/修改 |
 | DELETE | `/api/services/<名>` | 删除 |
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
 | POST | `/api/backups/<名>/restore` | 从备份恢复 |
+| GET | `/api/receipts/<请求号>` | 查看单个回执（不存在返回 404） |
+| GET | `/api/receipts?limit=20` | 最近的回执列表（最多 200 条） |
 
-浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
-成功后 303 跳回页面并显示结果或错误。
+浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`、
+`POST /resolve-trial`（试查），成功后 303 跳回页面并显示结果或错误；
+`GET /receipts/<请求号>` 是回执详情网页。
 
-查询响应示例：
+查询响应示例（带请求号，首次）：
+
+```json
+{"ok": true, "version": 6, "restore_in_progress": false,
+ "name": "orders-api", "found": true, "address": "10.0.0.12:8080",
+ "request_id": "req-001", "replay": false,
+ "receipt": {"request_id": "req-001", "service": "orders-api",
+             "version": 6, "found": true, "address": "10.0.0.12:8080",
+             "created_at": "2026-11-19T08:00:00Z"}}
+```
+
+服务不存在时 HTTP 仍为 200，`found` 为 `false` 且不含 `address` 字段，
+「未找到」本身也会作为回执被记录。同号重试时 `replay` 为 `true`；
+同号换服务返回 `409 request_id_conflict`。
+
+无请求号查询响应（保持旧格式，不含 `request_id`/`receipt` 字段）：
 
 ```json
 {"ok": true, "version": 6, "restore_in_progress": false,
@@ -86,6 +107,40 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 - **并发恢复。** 文件锁 + 数据库内的 `restore_state` 双重互斥，第二个恢复请求
   得到 409。
 
+## 请求号与回执语义
+
+值班员排障时需要核对客户端当初从 `/resolve` 拿到的地址。单名查询可以附带一个
+客户端生成的请求号 `request_id`（字母数字开头，仅含字母数字与 `_ . : -`，
+最长 128），规则如下：
+
+- **先存回执，再应答。** 首次带号请求在**一个 `BEGIN IMMEDIATE` 写事务**内完成：
+  读取当前 `current_version`、查出地址或「未找到」，把 `(请求号, 服务名,
+  目录版本, found, 地址)` 写入 `receipts` 表，事务提交成功后才返回响应。
+- **同号同服务重试永远返回原结果。** 之后无论目录改址、删除该服务、从备份恢复，
+  还是进程重启，同号同服务的请求都直接重放回执里的版本与地址（响应中
+  `replay: true`），旧回执永不修改。
+- **同号换服务报冲突。** 一个请求号只能绑定一个服务名；换服务名复用同一请求号
+  返回 `409 request_id_conflict`，且不会产生第二条回执、原回执不变。
+- **并发同号只留一份回执。** `receipts.request_id` 是主键，配合写事务串行化：
+  并发的同号请求中恰好一个完成首次登记，其余全部重放同一份回执，数据库里只有
+  一行。
+- **「未找到」也是结果。** 首次查询时服务不存在，会登记一条 `found=false` 的
+  回执；即使之后该服务被创建，同号重试仍返回「未找到」。
+- **恢复期间的带号查询。** 恢复进行中，带号查询依旧按当前完整目录应答并登记
+  回执（读的是尚未切换的 `current_version`）；恢复提交后的**新请求号**读取新
+  版本，而此前已登记的旧回执保持不变。
+- **发布与回执写入不交错。** 目录发布（切换 `current_version`）与回执写入都是
+  SQLite 写事务，彼此串行；回执记录的版本号与其应答内容必然对应同一个已提交
+  版本。若回执落库失败，整个事务回滚，接口返回 5xx，**绝不会**返回一个未经
+  记录的地址。
+- **无请求号查询照旧。** 不带 `request_id` 的查询行为与响应格式完全不变，也
+  不写任何回执；全目录查询（不带 `name`）不允许附带请求号，会返回 400。
+- **持久化与升级。** 回执与目录在同一个 SQLite 文件中，重启不丢；旧的 v1 数据库
+  首次打开时自动迁移到 v2（仅新增 `receipts` 表，原有数据不动）。
+
+网页上可以输入服务名与请求号「试查」（不填请求号即实时查询、不登记），
+页面下方列出最近回执，并可按请求号打开 `/receipts/<请求号>` 回执详情。
+
 ## 测试
 
 ```bash
@@ -109,6 +164,18 @@ python3 -m pytest -q
 - `test_live_restore_lease_survives_sibling_process_initialization`
 - `test_backup_row_pins_one_version_during_continuous_writes`
 - `test_http_rejects_writes_and_serves_reads_during_restore`
+- 回执语义：`test_first_request_with_id_persists_receipt_before_answer`、
+  `test_retry_same_id_same_service_replays_original_through_changes`、
+  `test_same_id_different_service_is_conflict_and_original_intact`、
+  `test_not_found_is_recorded_and_replayed_as_not_found`、
+  `test_concurrent_same_id_keeps_single_receipt`、
+  `test_concurrent_same_id_different_services_only_one_wins`、
+  `test_receipt_answers_match_committed_version_under_continuous_publish`、
+  `test_persist_failure_returns_error_never_unrecorded_address`、
+  `test_receipts_survive_directory_restore_and_process_restart`、
+  `test_id_queries_work_during_restore_and_freeze_after_commit`、
+  `test_v1_database_is_migrated_and_keeps_its_data`、
+  `test_http_resolve_with_request_id_flow`、`test_html_trial_form_and_receipt_page` 等
 - `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
 

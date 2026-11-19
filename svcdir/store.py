@@ -47,17 +47,22 @@ from .errors import (
     DirectoryError,
     InputError,
     NotFoundError,
+    ReceiptNotFound,
+    RequestIdConflict,
     RestoreInProgress,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BACKUP_FORMAT = "svcdir-backup-v1"
 MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MAX_REQUEST_ID_LENGTH = 128
+MAX_RECEIPT_LIST = 200
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 _RESTORE_KEYS = (
@@ -111,6 +116,20 @@ def validate_backup_name(raw: Any) -> str:
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in name):
         raise InputError("备份名称不能包含空白或控制字符")
     return name
+
+
+def validate_request_id(raw: Any) -> str:
+    request_id = _text(raw, "请求号")
+    if not request_id:
+        raise InputError("请求号不能为空")
+    if len(request_id) > MAX_REQUEST_ID_LENGTH:
+        raise InputError(f"请求号过长（最多 {MAX_REQUEST_ID_LENGTH} 个字符）")
+    if not REQUEST_ID_RE.fullmatch(request_id):
+        raise InputError(
+            "请求号不合法：需以字母或数字开头，仅可包含字母、数字、'_'、'.'、':'、'-'，"
+            f"长度 1-{MAX_REQUEST_ID_LENGTH}"
+        )
+    return request_id
 
 
 def _clean_note(raw: Any) -> str:
@@ -295,10 +314,15 @@ class DirectoryStore:
         ).fetchone()
         if has_meta:
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None or str(row["value"]) != str(SCHEMA_VERSION):
+            if row is None:
+                raise RuntimeError("数据库 schema 版本不兼容：缺少 schema_version")
+            found_version = str(row["value"])
+            if found_version == "1":
+                self._migrate_v1_to_v2(conn)
+                return
+            if found_version != str(SCHEMA_VERSION):
                 raise RuntimeError(
-                    f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 "
-                    f"{None if row is None else row['value']}"
+                    f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 {found_version}"
                 )
             return
         conn.execute(
@@ -338,6 +362,7 @@ class DirectoryStore:
             )
             """
         )
+        self._create_receipts_table(conn)
         now = _utc_now_iso()
         cur = conn.execute(
             "INSERT INTO versions(created_at, kind, note) VALUES (?, 'initial', '初始空目录')",
@@ -347,6 +372,31 @@ class DirectoryStore:
         self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
         self._meta_set(conn, "current_version", str(initial_version))
         self._meta_set(conn, "restore_state", "idle")
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """Add the receipts table; existing data keeps working untouched."""
+        self._create_receipts_table(conn)
+        self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
+
+    @staticmethod
+    def _create_receipts_table(conn: sqlite3.Connection) -> None:
+        # One row per request id, written before the response is sent.
+        # The PRIMARY KEY makes "concurrent same id keeps only one receipt"
+        # an invariant enforced by the database itself.
+        conn.execute(
+            """
+            CREATE TABLE receipts (
+                request_id TEXT PRIMARY KEY,
+                service TEXT NOT NULL,
+                version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE RESTRICT,
+                found INTEGER NOT NULL,
+                address TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        # rowid is the insertion order and is indexed implicitly, so
+        # "ORDER BY rowid DESC" needs no extra index.
 
     # -- meta helpers -----------------------------------------------------
 
@@ -564,6 +614,13 @@ class DirectoryStore:
                     "FROM backups ORDER BY created_at DESC, name"
                 ).fetchall()
             ]
+            receipts = [
+                self._receipt_to_dict(r)
+                for r in conn.execute(
+                    "SELECT request_id, service, version_id, found, address, created_at "
+                    "FROM receipts ORDER BY rowid DESC LIMIT 20"
+                ).fetchall()
+            ]
         return {
             "version": version,
             "count": len(rows),
@@ -572,6 +629,7 @@ class DirectoryStore:
             ],
             "restore": restore,
             "backups": backups,
+            "receipts": receipts,
         }
 
     def ping(self) -> None:
@@ -589,6 +647,123 @@ class DirectoryStore:
         self._ensure_ready()
         with self._txn(write=False) as conn:
             yield _PinnedView(conn, self)
+
+    # -- request-id receipts ----------------------------------------------
+
+    @staticmethod
+    def _receipt_to_dict(row: sqlite3.Row) -> dict:
+        found = bool(row["found"])
+        return {
+            "request_id": str(row["request_id"]),
+            "service": str(row["service"]),
+            "version": int(row["version_id"]),
+            "found": found,
+            "address": str(row["address"]) if found and row["address"] is not None else None,
+            "created_at": str(row["created_at"]),
+        }
+
+    def resolve_with_receipt(self, name: Any, request_id: Any) -> dict:
+        """Resolve one service under a client-supplied request id.
+
+        The first request for a given id persists a *receipt* (service name,
+        the committed directory version read, and the address/not-found result)
+        and only then returns.  Retries with the same id and service replay the
+        recorded answer forever, even if the directory later changes, deletes
+        the service, restores a backup, or the process restarts.  Reusing the
+        id for another service raises :class:`RequestIdConflict`.
+
+        Everything happens in one ``BEGIN IMMEDIATE`` transaction: the
+        ``current_version`` read and the receipt insert commit atomically, so a
+        published directory version and its receipt can never interleave out of
+        order.  If the insert cannot be committed the caller gets an error
+        instead of an unrecorded address.
+        """
+        service = validate_service_name(name)
+        rid = validate_request_id(request_id)
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            existing = conn.execute(
+                "SELECT request_id, service, version_id, found, address, created_at "
+                "FROM receipts WHERE request_id=?",
+                (rid,),
+            ).fetchone()
+            if existing is not None:
+                receipt = self._receipt_to_dict(existing)
+                if receipt["service"] != service:
+                    raise RequestIdConflict(rid, service, receipt["service"])
+                result = {
+                    "version": receipt["version"],
+                    "name": service,
+                    "found": receipt["found"],
+                    "address": receipt["address"],
+                    "replay": True,
+                    "request_id": rid,
+                    "receipt": receipt,
+                    "restore_in_progress": self._restore_summary(conn).get("state")
+                    == "restoring",
+                }
+                return result
+
+            version = self._current_version(conn)
+            row = conn.execute(
+                "SELECT address FROM entries WHERE version_id=? AND service=?",
+                (version, service),
+            ).fetchone()
+            found = row is not None
+            address = str(row["address"]) if found else None
+            created_at = _utc_now_iso()
+            conn.execute(
+                "INSERT INTO receipts(request_id, service, version_id, found, address, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (rid, service, version, 1 if found else 0, address, created_at),
+            )
+            receipt = {
+                "request_id": rid,
+                "service": service,
+                "version": version,
+                "found": found,
+                "address": address,
+                "created_at": created_at,
+            }
+            return {
+                "version": version,
+                "name": service,
+                "found": found,
+                "address": address,
+                "replay": False,
+                "request_id": rid,
+                "receipt": receipt,
+                "restore_in_progress": self._restore_summary(conn).get("state")
+                == "restoring",
+            }
+
+    def get_receipt(self, request_id: Any) -> dict:
+        rid = validate_request_id(request_id)
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            row = conn.execute(
+                "SELECT request_id, service, version_id, found, address, created_at "
+                "FROM receipts WHERE request_id=?",
+                (rid,),
+            ).fetchone()
+            if row is None:
+                raise ReceiptNotFound(rid)
+            return self._receipt_to_dict(row)
+
+    def list_receipts(self, limit: int = 20) -> list[dict]:
+        self._ensure_ready()
+        try:
+            cap = int(limit)
+        except (TypeError, ValueError):
+            cap = 20
+        cap = max(1, min(cap, MAX_RECEIPT_LIST))
+        with self._txn(write=False) as conn:
+            rows = conn.execute(
+                "SELECT request_id, service, version_id, found, address, created_at "
+                "FROM receipts ORDER BY rowid DESC LIMIT ?",
+                (cap,),
+            ).fetchall()
+            return [self._receipt_to_dict(row) for row in rows]
 
     # -- writes -----------------------------------------------------------
 

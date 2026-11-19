@@ -102,8 +102,56 @@
   </section>
 
   <section class="card">
+    <h2>查询试查 / 回执</h2>
+    <form method="post" action="{{ url_for('form_resolve_trial') }}" class="grid">
+      <label>服务名
+        <input name="service" maxlength="128" placeholder="orders-api">
+      </label>
+      <label>请求号（可选）
+        <input name="request_id" maxlength="128" placeholder="例如 req-20261119-0001">
+      </label>
+      <button type="submit">试查</button>
+    </form>
+    <p class="muted small">
+      带请求号的单名查询会先把「服务名、目录版本、地址或未找到」存成回执再应答；
+      同号同服务重试永远返回回执原结果，同号换服务报 409 冲突。不填请求号则按当前目录实时查询、不登记回执。
+    </p>
+
+    <form id="rid-jump" class="inline" data-jump-prefix="/receipts/">
+      <label class="grow">按请求号查看回执
+        <input name="rid" id="rid-input" maxlength="128" placeholder="请求号">
+      </label>
+      <button type="submit">查看</button>
+    </form>
+
+    {% if state.receipts %}
+    <table>
+      <thead><tr><th>请求号</th><th>服务名</th><th>目录版本</th><th>结果</th><th>登记时间</th><th></th></tr></thead>
+      <tbody>
+      {% for r in state.receipts %}
+        <tr>
+          <td class="mono">{{ r.request_id }}</td>
+          <td class="mono">{{ r.service }}</td>
+          <td>{{ r.version }}</td>
+          <td class="mono">{% if r.found %}{{ r.address }}{% else %}<span class="muted">未找到</span>{% endif %}</td>
+          <td class="mono small">{{ r.created_at }}</td>
+          <td class="right">
+            <a class="btnlink" href="{{ url_for('form_receipt_detail', request_id=r.request_id) }}">查看回执</a>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">尚无回执。带请求号发起一次查询后会在此出现。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
     <h2>查询 API</h2>
     <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+    <p class="mono small">GET /resolve?name=&lt;服务名&gt;&amp;request_id=&lt;请求号&gt;（登记/重放回执）</p>
+    <p class="mono small">GET /api/receipts/&lt;请求号&gt; &nbsp;·&nbsp; GET /api/receipts（最近回执）</p>
   </section>
 </main>
 </body>
